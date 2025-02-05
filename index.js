@@ -14,7 +14,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = path.join(__dirname, 'node_modules/pdfj
 // Initialize express app and other middleware
 const app = express();
 app.use(cors({
-  origin: 'http://localhost:3000',
+  origin:  [
+    'http://localhost:3000',
+    'https://namtech-pdf.netlify.app'  // Add your Netlify domain
+  ],
   methods: ['GET', 'POST', 'DELETE'], // Add DELETE to allowed methods
   allowedHeaders: ['Content-Type']
 }));
