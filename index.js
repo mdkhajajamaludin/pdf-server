@@ -17,7 +17,7 @@ app.use(cors({
   origin: [
     'http://localhost:3000',
     'https://namtech-pdf.netlify.app',  // Add your Netlify domain
-    'https://pdf-server-iid0.onrender.com'  // Add your Render domain
+    'https://pdf-server-gin9.onrender.com/'  // Add your Render domain
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
