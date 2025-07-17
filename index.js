@@ -97,6 +97,7 @@ initializeDatabase();
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 // Configure multer for file upload
 const storage = multer.diskStorage({
@@ -234,11 +235,11 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
   }
 });
 
-// Update chat endpoint with better logging
+// Update chat endpoint
 app.post('/api/chat', async (req, res) => {
   let client;
   try {
-    const { pdfId, question, userId } = req.body;
+    const { pdfId, question, userId, sourceOnly = true } = req.body;
     console.log('Chat request received:', { pdfId, userId, question });
     
     client = await pool.connect();
@@ -271,18 +272,49 @@ app.post('/api/chat', async (req, res) => {
     const pdfContent = pdfResult.rows[0].content;
     console.log('Content length:', pdfContent.length);
 
-    // Initialize Gemini AI model
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    // Reduce content length to stay within Gemini's limits
+    // Using a reasonable limit for Gemini API
+    const MAX_CONTENT_LENGTH = 25000; // Increased slightly to include more context
+    const truncatedContent = pdfContent.slice(0, MAX_CONTENT_LENGTH);
+    
+    // Enhanced prompt to strictly answer only from PDF content
+    const prompt = `You are a PDF document assistant. Answer STRICTLY with information directly from the provided document content.
 
-    // Create a more focused prompt
-    const truncatedContent = pdfContent.slice(0, 30000); // Limit content length
-    const prompt = `Based on this document content, please answer the question: "${question}"\n\nRelevant document content: ${truncatedContent}`;
+    CRITICAL INSTRUCTIONS:
+    1. ONLY use information that is explicitly stated in the document content.
+    2. If the answer is not in the document, respond ONLY with "I don't find information about that in the document."
+    3. DO NOT include ANY information from outside the document.
+    4. DO NOT include phrases like "According to the document", "Based on the document", or similar prefixes.
+    5. DO NOT include ANY disclaimers, introductions, or explanations.
+    6. Just provide the direct factual answer found in the document.
+    7. DO NOT make up or infer information not explicitly stated.
+    8. Keep answers concise and direct.
+    9. Format your answer clearly matching the style of the document when appropriate.
+    10. For mathematical content, preserve equations exactly as they appear.
+    
+    Question: "${question}"
+    
+    Document content: ${truncatedContent}`;
 
-    const aiResponse = await model.generateContent(prompt);
-    const response = await aiResponse.response;
-    const text = response.text();
+    // Log prompt length for debugging
+    console.log('Prompt length:', prompt.length);
 
-    res.json({ answer: text });
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    let answer = response.text() || '';
+    
+    // Further clean up the response to remove any meta-commentary
+    answer = answer
+      .replace(/^(according to the (document|pdf|text|content)|the (document|pdf|text) (states|mentions|says|indicates|shows|provides|contains|notes)|based on the (document|pdf|text|content)|from the (document|pdf|text)|in the (document|pdf|text))/gi, '')
+      .replace(/^(i can see that|i found that|i notice that|i observe that|i found in the document)/gi, '')
+      .replace(/^(to answer your question|regarding your question|in response to your question)/gi, '')
+      .replace(/^(here is|here's|the answer is|the information is)/gi, '')
+      .trim()
+      .replace(/^[:.,-\s]+/, '')
+      .trim();
+      
+    res.json({ answer });
+    
   } catch (error) {
     console.error('Chat error:', error);
     res.status(500).json({ error: error.message });
