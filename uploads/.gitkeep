@@ -1,3 +1,0 @@
-# Ignore everything in uploads except .gitkeep
-uploads/*
-!uploads/.gitkeep

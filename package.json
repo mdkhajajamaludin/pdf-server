@@ -18,10 +18,14 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "groq-sdk": "^0.15.0",
+    "mammoth": "^1.10.0",
     "multer": "^1.4.5-lts.1",
     "pdf-parse": "^1.1.1",
     "pdfjs-dist": "^3.11.174",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "pptx2json": "^0.0.10",
+    "textract": "^2.5.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"

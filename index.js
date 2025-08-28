@@ -4,8 +4,11 @@ const multer = require('multer');
 const { Pool } = require('pg');
 const path = require('path');
 const fs = require('fs');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const Groq = require('groq-sdk');
 const pdfjsLib = require('pdfjs-dist');
+const mammoth = require('mammoth'); // For Word documents
+const xlsx = require('xlsx'); // For Excel files
+const textract = require('textract'); // For various document formats
 require('dotenv').config();
 
 // Set up PDF.js worker
@@ -13,17 +16,68 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = path.join(__dirname, 'node_modules/pdfj
 
 // Initialize express app and other middleware
 const app = express();
+
+// Add preflight OPTIONS handler for all routes
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.sendStatus(200);
+});
 app.use(cors({
-  origin: [
-    'http://localhost:3000',
-    'https://namtech-pdf.netlify.app',  // Add your Netlify domain
-    'https://pdf-server-gin9.onrender.com/'  // Add your Render domain
-  ],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+
+    const allowedOrigins = [
+      'http://localhost:3000',
+      'http://localhost:5173',
+      'http://localhost:5174',
+      'https://namtech-pdf.netlify.app',
+      'https://pdf-server-gin9.onrender.com/',
+      /^http:\/\/localhost:\d+$/,  // Allow any localhost port
+      /^https:\/\/.*\.netlify\.app$/,  // Allow any Netlify subdomain
+      /^https:\/\/.*\.onrender\.com$/  // Allow any Render subdomain
+    ];
+
+    const isAllowed = allowedOrigins.some(allowedOrigin => {
+      if (typeof allowedOrigin === 'string') {
+        return allowedOrigin === origin;
+      } else if (allowedOrigin instanceof RegExp) {
+        return allowedOrigin.test(origin);
+      }
+      return false;
+    });
+
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      console.log('CORS blocked origin:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-  credentials: true
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+  credentials: true,
+  optionsSuccessStatus: 200 // Some legacy browsers choke on 204
 }));
 app.use(express.json());
+
+// Additional CORS middleware to ensure headers are always present
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  next();
+});
+
 app.use('/uploads', express.static('uploads'));
 
 // Create uploads directory if it doesn't exist
@@ -95,8 +149,10 @@ const initializeDatabase = async () => {
 // Initialize database on startup
 initializeDatabase();
 
-// Initialize Gemini AI
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Replace Gemini import with Groq
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY // Make sure to add this to your .env file
+});
 
 // Configure multer for file upload
 const storage = multer.diskStorage({
@@ -105,20 +161,44 @@ const storage = multer.diskStorage({
   },
   filename: function (req, file, cb) {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'pdf-' + uniqueSuffix + path.extname(file.originalname));
+    const fileExtension = path.extname(file.originalname);
+    cb(null, 'doc-' + uniqueSuffix + fileExtension);
   }
 });
+
+// Supported file types
+const SUPPORTED_MIME_TYPES = [
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
+  'application/msword', // .doc
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation', // .pptx
+  'application/vnd.ms-powerpoint', // .ppt
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
+  'application/vnd.ms-excel', // .xls
+  'text/plain', // .txt
+  'text/csv', // .csv
+  'application/rtf', // .rtf
+  'application/vnd.oasis.opendocument.text', // .odt
+  'application/vnd.oasis.opendocument.presentation', // .odp
+  'application/vnd.oasis.opendocument.spreadsheet' // .ods
+];
 
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 50 * 1024 * 1024 // Increased to 50MB limit
+    fileSize: 50 * 1024 * 1024 // 50MB limit
   },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/pdf') {
+    console.log('File upload attempt:', {
+      originalname: file.originalname,
+      mimetype: file.mimetype,
+      size: file.size
+    });
+
+    if (SUPPORTED_MIME_TYPES.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Only PDF files are allowed!'), false);
+      cb(new Error(`File type ${file.mimetype} is not supported. Supported types: PDF, Word, PowerPoint, Excel, Text, CSV, RTF, and OpenDocument formats.`), false);
     }
   }
 });
@@ -126,16 +206,24 @@ const upload = multer({
 // Routes
 // Get PDFs for a user
 app.get('/api/pdfs/:userId', async (req, res) => {
+  console.log(`📥 GET /api/pdfs/${req.params.userId} - Request received`);
+  console.log('Headers:', req.headers);
+  console.log('Origin:', req.get('Origin'));
+
   const client = await pool.connect();
   try {
     const { userId } = req.params;
+    console.log(`🔍 Fetching PDFs for user: ${userId}`);
+
     const result = await client.query(
       'SELECT * FROM pdfs WHERE user_id = $1 ORDER BY created_at DESC',
       [userId]
     );
+
+    console.log(`✅ Found ${result.rows.length} PDFs for user ${userId}`);
     res.json(result.rows);
   } catch (error) {
-    console.error('Fetch error:', error);
+    console.error('❌ Fetch error:', error);
     res.status(500).json({
       error: 'Failed to fetch PDFs: ' + error.message
     });
@@ -144,7 +232,7 @@ app.get('/api/pdfs/:userId', async (req, res) => {
   }
 });
 
-// PDF extraction function
+// Document extraction functions
 const extractTextFromPDF = async (filePath) => {
   try {
     const dataBuffer = fs.readFileSync(filePath);
@@ -169,8 +257,155 @@ const extractTextFromPDF = async (filePath) => {
   }
 };
 
-// Update the upload endpoint with better logging
-app.post('/api/upload', upload.single('pdf'), async (req, res) => {
+const extractTextFromWord = async (filePath) => {
+  try {
+    console.log('Extracting Word document:', filePath);
+    const result = await mammoth.extractRawText({ path: filePath });
+    const text = result.value ? result.value.trim() : '';
+    console.log('Word extraction successful, text length:', text.length);
+    return text;
+  } catch (error) {
+    console.error('Word extraction error:', error);
+    // Fallback to textract for Word documents
+    console.log('Falling back to textract for Word document');
+    return await extractTextWithTextract(filePath);
+  }
+};
+
+const extractTextFromExcel = async (filePath) => {
+  try {
+    console.log('Extracting Excel file:', filePath);
+    const workbook = xlsx.readFile(filePath);
+    let fullText = '';
+    
+    workbook.SheetNames.forEach(sheetName => {
+      const worksheet = workbook.Sheets[sheetName];
+      const sheetData = xlsx.utils.sheet_to_csv(worksheet);
+      fullText += `Sheet: ${sheetName}\n${sheetData}\n\n`;
+    });
+    
+    const text = fullText.trim();
+    console.log('Excel extraction successful, text length:', text.length);
+    return text;
+  } catch (error) {
+    console.error('Excel extraction error:', error);
+    // Fallback to textract for Excel files
+    console.log('Falling back to textract for Excel file');
+    return await extractTextWithTextract(filePath);
+  }
+};
+
+const extractTextFromPowerPoint = async (filePath) => {
+  try {
+    // Use textract for PowerPoint files as it's more reliable
+    return await extractTextWithTextract(filePath);
+  } catch (error) {
+    console.error('PowerPoint extraction error:', error);
+    throw new Error('Failed to extract text from PowerPoint: ' + error.message);
+  }
+};
+
+const extractTextFromPlainText = async (filePath) => {
+  try {
+    return fs.readFileSync(filePath, 'utf8').trim();
+  } catch (error) {
+    console.error('Text file extraction error:', error);
+    throw new Error('Failed to read text file: ' + error.message);
+  }
+};
+
+// Generic text extraction using textract as fallback
+const extractTextWithTextract = async (filePath) => {
+  return new Promise((resolve, reject) => {
+    console.log('Using textract for file:', filePath);
+    
+    textract.fromFileWithPath(filePath, { preserveLineBreaks: true }, (error, text) => {
+      if (error) {
+        console.error('Textract error:', error);
+        reject(new Error('Failed to extract text: ' + error.message));
+      } else {
+        const cleanText = text ? text.trim() : '';
+        console.log('Textract extracted text length:', cleanText.length);
+        resolve(cleanText);
+      }
+    });
+  });
+};
+
+// Main document extraction function
+const extractTextFromDocument = async (filePath, mimeType) => {
+  console.log(`Extracting text from ${filePath} with mime type: ${mimeType}`);
+  
+  try {
+    let text = '';
+    
+    switch (mimeType) {
+      case 'application/pdf':
+        text = await extractTextFromPDF(filePath);
+        break;
+        
+      case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+      case 'application/msword':
+        text = await extractTextFromWord(filePath);
+        break;
+        
+      case 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+      case 'application/vnd.ms-excel':
+        text = await extractTextFromExcel(filePath);
+        break;
+        
+      case 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+      case 'application/vnd.ms-powerpoint':
+        text = await extractTextFromPowerPoint(filePath);
+        break;
+        
+      case 'text/plain':
+      case 'text/csv':
+        text = await extractTextFromPlainText(filePath);
+        break;
+        
+      default:
+        // Use textract as fallback for other formats
+        console.log('Using textract as primary method for mime type:', mimeType);
+        text = await extractTextWithTextract(filePath);
+        break;
+    }
+    
+    if (!text || text.length === 0) {
+      console.log('No text extracted, trying textract as final fallback');
+      text = await extractTextWithTextract(filePath);
+    }
+    
+    if (!text || text.length === 0) {
+      throw new Error('No text content could be extracted from the document');
+    }
+    
+    console.log(`Successfully extracted ${text.length} characters from document`);
+    return text;
+    
+  } catch (error) {
+    console.error('Document extraction failed:', error);
+    
+    // Final fallback attempt with textract
+    if (!error.message.includes('textract')) {
+      try {
+        console.log('Attempting final fallback with textract');
+        const fallbackText = await extractTextWithTextract(filePath);
+        if (fallbackText && fallbackText.length > 0) {
+          console.log('Fallback extraction successful');
+          return fallbackText;
+        }
+      } catch (fallbackError) {
+        console.error('Fallback extraction also failed:', fallbackError);
+      }
+    }
+    
+    throw error;
+  }
+};
+
+// Update the upload endpoint to handle multiple document types
+app.post('/api/upload', upload.single('document'), async (req, res) => {
   let client;
   try {
     client = await pool.connect();
@@ -191,14 +426,16 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
       });
     }
 
-    // Extract text from PDF using PDF.js
+    // Extract text from document using appropriate method
     console.log('Starting text extraction from:', req.file.path);
-    const pdfText = await extractTextFromPDF(req.file.path);
-    console.log('Extracted text length:', pdfText.length);
-    console.log('First 100 characters of extracted text:', pdfText.substring(0, 100));
+    console.log('File mime type:', req.file.mimetype);
+    
+    const documentText = await extractTextFromDocument(req.file.path, req.file.mimetype);
+    console.log('Extracted text length:', documentText.length);
+    console.log('First 100 characters of extracted text:', documentText.substring(0, 100));
 
-    if (!pdfText || pdfText.length === 0) {
-      throw new Error('No text could be extracted from the PDF');
+    if (!documentText || documentText.length === 0) {
+      throw new Error('No text could be extracted from the document');
     }
 
     // Log the query parameters
@@ -206,19 +443,51 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
       userId: req.body.userId,
       fileName: req.file.originalname,
       filePath: req.file.filename,
-      contentLength: pdfText.length
+      contentLength: documentText.length,
+      mimeType: req.file.mimetype
     });
 
-    const result = await client.query(
-      'INSERT INTO pdfs (user_id, file_name, file_path, content) VALUES ($1, $2, $3, $4) RETURNING *',
-      [req.body.userId, req.file.originalname, req.file.filename, pdfText]
-    );
+    // Check if file_type column exists and add it if not
+    try {
+      const columnCheck = await client.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'pdfs' AND column_name = 'file_type';
+      `);
+      
+      if (columnCheck.rows.length === 0) {
+        console.log('Adding file_type column to pdfs table');
+        await client.query('ALTER TABLE pdfs ADD COLUMN file_type VARCHAR(100);');
+      }
+    } catch (alterError) {
+      console.log('Error checking/adding file_type column:', alterError.message);
+    }
+
+    // Try inserting with file_type, fallback without it if column doesn't exist
+    let result;
+    try {
+      result = await client.query(
+        'INSERT INTO pdfs (user_id, file_name, file_path, content, file_type) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+        [req.body.userId, req.file.originalname, req.file.filename, documentText, req.file.mimetype]
+      );
+    } catch (insertError) {
+      if (insertError.message.includes('file_type')) {
+        console.log('Falling back to insert without file_type column');
+        result = await client.query(
+          'INSERT INTO pdfs (user_id, file_name, file_path, content) VALUES ($1, $2, $3, $4) RETURNING *',
+          [req.body.userId, req.file.originalname, req.file.filename, documentText]
+        );
+      } else {
+        throw insertError;
+      }
+    }
 
     console.log('Database insert successful, returned row:', result.rows[0]);
 
     return res.status(200).json({
       success: true,
-      file: result.rows[0]
+      file: result.rows[0],
+      fileType: req.file.mimetype
     });
   } catch (error) {
     console.error('Upload error:', error);
@@ -227,19 +496,19 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
     }
     return res.status(500).json({
       success: false,
-      error: error.message || 'Failed to process PDF'
+      error: error.message || 'Failed to process document'
     });
   } finally {
     if (client) client.release();
   }
 });
 
-// Update chat endpoint with better logging
+// Update chat endpoint
 app.post('/api/chat', async (req, res) => {
   let client;
   try {
-    const { pdfId, question, userId } = req.body;
-    console.log('Chat request received:', { pdfId, userId, question });
+    const { pdfId, question, userId, includeReasoning } = req.body;
+    console.log('Chat request received:', { pdfId, userId, question, includeReasoning });
     
     client = await pool.connect();
     
@@ -271,23 +540,136 @@ app.post('/api/chat', async (req, res) => {
     const pdfContent = pdfResult.rows[0].content;
     console.log('Content length:', pdfContent.length);
 
-    // Initialize Gemini AI model
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    // Reduce content length to stay within Groq's rate limits
+    // Using a smaller limit (around 4000 tokens ≈ 16000 characters)
+    const truncatedContent = pdfContent.slice(0, 16000);
 
-    // Create a more focused prompt
-    const truncatedContent = pdfContent.slice(0, 30000); // Limit content length
-    const prompt = `Based on this document content, please answer the question: "${question}"\n\nRelevant document content: ${truncatedContent}`;
+    // Create different prompts based on whether reasoning is requested
+    let prompt;
+    let model;
 
-    const aiResponse = await model.generateContent(prompt);
-    const response = await aiResponse.response;
-    const text = response.text();
+    if (includeReasoning) {
+      // Use reasoning model and prompt for detailed thinking
+      model = "deepseek-r1-distill-llama-70b";
+      prompt = `Based on this document content, please answer the question: "${question}"
 
-    res.json({ answer: text });
+Document content: ${truncatedContent}
+
+Please think through this step by step and show your reasoning process.`;
+    } else {
+      // Use regular model for direct answers
+      model = "llama-3.1-70b-versatile";
+      prompt = `Based on this document content, please answer the question in plain text without any special formatting or markdown: "${question}"\n\nRelevant document content: ${truncatedContent}`;
+    }
+
+    const chatCompletion = await groq.chat.completions.create({
+      messages: [
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      model: model,
+      temperature: 0.6,
+      max_tokens: null,
+      top_p: 0.95,
+      stream: false,
+      stop: null
+    });
+
+    let response = chatCompletion.choices[0]?.message?.content || '';
+
+    // Process response based on model type
+    if (includeReasoning && model === "deepseek-r1-distill-llama-70b") {
+      // DeepSeek R1 models often include <think> tags for reasoning
+      const thinkMatch = response.match(/<think>(.*?)<\/think>/s);
+      const reasoning = thinkMatch ? thinkMatch[1].trim() : null;
+
+      // Extract the final answer (everything after </think> or the whole response if no think tags)
+      let answer = response.replace(/<think>.*?<\/think>/s, '').trim();
+      if (!answer && !reasoning) {
+        // If no think tags found, treat the whole response as the answer
+        answer = response;
+      }
+
+      // Clean up formatting
+      answer = answer.replace(/\*\*/g, '');
+
+      res.json({
+        answer: answer || 'No answer provided',
+        reasoning: reasoning || null
+      });
+    } else {
+      // Regular response without reasoning
+      response = response.replace(/\*\*/g, '');  // Remove all double asterisks
+      res.json({ answer: response });
+    }
+    
   } catch (error) {
     console.error('Chat error:', error);
     res.status(500).json({ error: error.message });
   } finally {
     if (client) client.release();
+  }
+});
+
+// PDF preview endpoint - serve PDF files
+app.get('/api/pdf/:id', async (req, res) => {
+  let client;
+  try {
+    const { id } = req.params;
+    const { userId } = req.query;
+
+    console.log('PDF preview request received:', { id, userId });
+
+    if (!id || !userId) {
+      return res.status(400).json({
+        error: 'Missing required parameters'
+      });
+    }
+
+    client = await pool.connect();
+
+    // Check if PDF exists and belongs to user
+    const result = await client.query(
+      'SELECT file_path, file_name FROM pdfs WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'PDF not found or unauthorized'
+      });
+    }
+
+    const { file_path, file_name } = result.rows[0];
+    const filePath = path.join(__dirname, 'uploads', file_path);
+
+    // Check if file exists on disk
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        error: 'PDF file not found on server'
+      });
+    }
+
+    // Set appropriate headers for PDF viewing
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${file_name}"`);
+    res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache for 1 hour
+
+    // Stream the PDF file
+    const fileStream = fs.createReadStream(filePath);
+    fileStream.pipe(res);
+
+  } catch (error) {
+    console.error('PDF preview error:', error);
+    res.status(500).json({
+      error: 'Failed to serve PDF: ' + error.message
+    });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
