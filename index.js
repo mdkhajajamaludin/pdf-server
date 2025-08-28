@@ -149,10 +149,16 @@ const initializeDatabase = async () => {
 // Initialize database on startup
 initializeDatabase();
 
+<<<<<<< HEAD
 // Replace Gemini import with Groq
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY // Make sure to add this to your .env file
 });
+=======
+// Initialize Gemini AI
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+>>>>>>> c67f260faa04889ed4096d7f75025bd64cbe5fec
 
 // Configure multer for file upload
 const storage = multer.diskStorage({
@@ -507,8 +513,13 @@ app.post('/api/upload', upload.single('document'), async (req, res) => {
 app.post('/api/chat', async (req, res) => {
   let client;
   try {
+<<<<<<< HEAD
     const { pdfId, question, userId, includeReasoning } = req.body;
     console.log('Chat request received:', { pdfId, userId, question, includeReasoning });
+=======
+    const { pdfId, question, userId, sourceOnly = true } = req.body;
+    console.log('Chat request received:', { pdfId, userId, question });
+>>>>>>> c67f260faa04889ed4096d7f75025bd64cbe5fec
     
     client = await pool.connect();
     
@@ -540,6 +551,7 @@ app.post('/api/chat', async (req, res) => {
     const pdfContent = pdfResult.rows[0].content;
     console.log('Content length:', pdfContent.length);
 
+<<<<<<< HEAD
     // Reduce content length to stay within Groq's rate limits
     // Using a smaller limit (around 4000 tokens ≈ 16000 characters)
     const truncatedContent = pdfContent.slice(0, 16000);
@@ -604,6 +616,50 @@ Please think through this step by step and show your reasoning process.`;
       response = response.replace(/\*\*/g, '');  // Remove all double asterisks
       res.json({ answer: response });
     }
+=======
+    // Reduce content length to stay within Gemini's limits
+    // Using a reasonable limit for Gemini API
+    const MAX_CONTENT_LENGTH = 25000; // Increased slightly to include more context
+    const truncatedContent = pdfContent.slice(0, MAX_CONTENT_LENGTH);
+    
+    // Enhanced prompt to strictly answer only from PDF content
+    const prompt = `You are a PDF document assistant. Answer STRICTLY with information directly from the provided document content.
+
+    CRITICAL INSTRUCTIONS:
+    1. ONLY use information that is explicitly stated in the document content.
+    2. If the answer is not in the document, respond ONLY with "I don't find information about that in the document."
+    3. DO NOT include ANY information from outside the document.
+    4. DO NOT include phrases like "According to the document", "Based on the document", or similar prefixes.
+    5. DO NOT include ANY disclaimers, introductions, or explanations.
+    6. Just provide the direct factual answer found in the document.
+    7. DO NOT make up or infer information not explicitly stated.
+    8. Keep answers concise and direct.
+    9. Format your answer clearly matching the style of the document when appropriate.
+    10. For mathematical content, preserve equations exactly as they appear.
+    
+    Question: "${question}"
+    
+    Document content: ${truncatedContent}`;
+
+    // Log prompt length for debugging
+    console.log('Prompt length:', prompt.length);
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    let answer = response.text() || '';
+    
+    // Further clean up the response to remove any meta-commentary
+    answer = answer
+      .replace(/^(according to the (document|pdf|text|content)|the (document|pdf|text) (states|mentions|says|indicates|shows|provides|contains|notes)|based on the (document|pdf|text|content)|from the (document|pdf|text)|in the (document|pdf|text))/gi, '')
+      .replace(/^(i can see that|i found that|i notice that|i observe that|i found in the document)/gi, '')
+      .replace(/^(to answer your question|regarding your question|in response to your question)/gi, '')
+      .replace(/^(here is|here's|the answer is|the information is)/gi, '')
+      .trim()
+      .replace(/^[:.,-\s]+/, '')
+      .trim();
+      
+    res.json({ answer });
+>>>>>>> c67f260faa04889ed4096d7f75025bd64cbe5fec
     
   } catch (error) {
     console.error('Chat error:', error);
